@@ -204,6 +204,21 @@ class CartMutationRequest(BaseModel):
 
 
 class IntentResult(BaseModel):
+    """意图识别阶段的结构化输出。
+
+    它不只是一个 ``intent`` 字符串，还携带后续 Handler 执行业务所需的
+    品类、约束和目标商品信息。可以把它理解为 Java 中的 ``IntentCommand DTO``：
+
+    - Pipeline 负责生产和修正这个 DTO；
+    - ``INTENT_HANDLERS`` 根据 ``intent`` 选择具体策略；
+    - Handler 使用剩余字段执行推荐、加购或对比。
+
+    无论数据来自确定性规则还是 LLM，最终都必须收敛成这个模型。
+    Pydantic 会拒绝未声明的 intent 类型，避免模型随意发明路由名称。
+    """
+
+    # 路由键：决定后续从 INTENT_HANDLERS 中取哪个 Handler。
+    # Literal 类似 Java enum 的白名单约束，列表之外的值无法通过模型校验。
     intent: Literal[
         "recommend",
         "clarify",
@@ -219,12 +234,29 @@ class IntentResult(BaseModel):
         "checkout_cancel",
         "chitchat",
     ]
+
+    # 规则命中时通常为 1.0；LLM 路径则保留模型给出的置信度。
+    # 当前业务不直接用它做路由，主要用于诊断和后续策略扩展。
     confidence: float = 1.0
+
+    # 四个一级品类之一。允许为空，因为“送朋友礼物”等场景可能尚未确定品类。
     category: str | None = None
+
+    # 意图阶段提取出的初步约束，例如 budget_max、skin_type、product_type。
+    # 这里还是“草稿”，后续 Criteria 阶段会生成受 Constraints DSL 约束的正式标准。
     extracted_constraints: dict[str, Any] = Field(default_factory=dict)
+
+    # 不适合做硬过滤、但可影响推荐排序或文案的偏好。
     soft_preferences: list[str] = Field(default_factory=list)
+
+    # 购物车操作的目标商品 ID；序数指代解析成功时可以直接得到。
     target_product_id: str | None = None
+
+    # 无法直接解析 ID 时，可由 LLM 提取商品名，之后再与历史候选进行匹配。
     target_product_name: str | None = None
+
+    # 对比意图中的商品引用。允许 str/int 是为了兼容历史协议和序数输入，
+    # 后处理阶段会将它们解析为真实 product_id。
     compare_product_ids: list[str | int] = Field(default_factory=list)
 
 

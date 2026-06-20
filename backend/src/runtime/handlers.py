@@ -1489,19 +1489,46 @@ def _no_match_followup_text(criteria: CriteriaPayload) -> str:
     return msg.FOLLOWUP_NO_MATCH_ADJUST_TEMPLATE.format(suggestions="、".join(dict.fromkeys(suggestions)))
 
 
+# 意图 → 用例处理器注册表。
+#
+# 这相当于 Java 中的 ``Map<IntentType, IntentHandler>``：
+#
+#     IntentHandler handler = handlers.get(intent.type());
+#     handler.handle(context, request, intent);
+#
+# Pipeline 只负责查表和调用，不需要写一长串 if/else，也不需要了解每个业务
+# 的内部实现。它体现的是“策略模式 + 注册表分发”，而不是让 LLM 自由选择工具。
 INTENT_HANDLERS: dict[str, IntentHandler] = {
+    # 首次推荐：生成 Criteria、检索商品、生成推荐解释与决策。
     "recommend": handle_recommendation,
+
+    # clarify 表示意图仍是购物推荐，只是信息可能不完整。
+    # 真正缺槽位时 Pipeline 会提前发 ClarificationEvent；能走到这里时可复用推荐流。
     "clarify": handle_recommendation,
+
+    # 继续上一轮：复用已有 Criteria/候选，根据反馈决定继续推荐还是收敛决策。
     "continue": handle_continue,
+
+    # 反馈会先持久化，再使用新的偏好/排除条件重新推荐。
     "feedback": handle_recommendation,
+
+    # 结构化多商品对比。
     "compare": handle_compare,
+
+    # 查看购物车，不进入 RAG 推荐链路。
     "view_cart": handle_view_cart,
+
+    # 购买意向闭环。这里只做预览/确认/取消，不执行真实支付。
     "checkout_preview": handle_checkout_preview,
     "checkout_confirm": handle_checkout_confirm,
     "checkout_cancel": handle_checkout_cancel,
+
+    # 购物车 CRUD。
     "add_to_cart": handle_add_to_cart,
     "remove_from_cart": handle_remove_from_cart,
     "update_cart_quantity": handle_update_cart_quantity,
+
+    # 闲聊不调用商品检索，只返回能力引导文案。
     "chitchat": handle_chitchat,
 }
 

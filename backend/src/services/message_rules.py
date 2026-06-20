@@ -347,8 +347,14 @@ _REPLACE_DECK_PATTERNS = (
 
 
 def is_replace_deck_phrase(message: str) -> bool:
-    """True when the user is asking to replace the current deck with fresh candidates."""
+    """判断用户是否要求“换一批候选商品”。
+
+    这是纯函数：没有数据库和网络 I/O，相当于 Java 中的静态规则方法。
+    命中后 Pipeline 会继承上一轮 Criteria，而不是让用户重新描述需求。
+    """
+    # strip 去除首尾空白；lower 兼容英文形式。中文文本调用 lower 不会改变内容。
     lowered = message.strip().lower()
+    # any(...) 会短路：只要任意短语被包含就立即返回 True。
     return any(pattern in lowered for pattern in _REPLACE_DECK_PATTERNS)
 
 
@@ -442,39 +448,61 @@ _CONFIRM_TRAILING_PUNCT = "。！？!?,，~啊呢哦额嗯"
 
 
 def maybe_checkout_intent(message: str) -> IntentResult | None:
+    """尝试用确定性规则识别结算意图。
+
+    返回 ``IntentResult`` 表示规则已经给出确定答案；返回 ``None`` 表示
+    “本规则无法判断”，Pipeline 会继续尝试购物车规则或 LLM。
+    这种 ``Result | None`` 约定相当于 Java 中返回 nullable 结果或 Optional。
+    """
+    # 所有规则统一在去除首尾空白后匹配，避免用户多输入空格导致漏判。
     text = message.strip()
     if not text:
+        # 空文本不属于结算意图，交给其他校验/路由处理。
         return None
+
+    # 取消优先级最高。“先不买了”不能被后续“确认”类词语覆盖。
     if any(term in text for term in INTENT_TERMS["checkout_cancel"]):
         return IntentResult(intent="checkout_cancel", confidence=1.0)
+
     # Exact match after stripping trailing punctuation — avoids hijacking
     # "确认标准" while accepting "确认了。" or "就这样吧".
+    # 这里只做“整句确认”，不使用 contains，防止“确认标准”被误判为确认结算。
     normalized = text.rstrip(_CONFIRM_TRAILING_PUNCT)
     if normalized in INTENT_TERMS["checkout_confirm"] or text in INTENT_TERMS["checkout_confirm"]:
         return IntentResult(intent="checkout_confirm", confidence=1.0)
+
+    # “订单状态怎么样”虽然包含订单词，但它是提问，不是发起结算。
+    # 返回 None，让更合适的规则或 LLM 决定。
     if any(marker in text for marker in _CHECKOUT_QUESTION_MARKERS):
         return None
+
+    # 预览结算只展示购买意向摘要，不代表真实支付或创建订单。
     if any(term in text for term in INTENT_TERMS["checkout_preview"]):
         return IntentResult(intent="checkout_preview", confidence=1.0)
+
+    # 当前规则无结论。
     return None
 
 
 def maybe_shopping_intent(message: str) -> IntentResult | None:
-    """Deterministic pre-check for clearly non-shopping inputs only.
+    """识别明确的非购物输入，并快速路由到闲聊 Handler。
 
-    Only short-circuits for obvious mismatches (greetings, capability questions).
-    Does NOT short-circuit for shopping signals — those go through the LLM
-    for proper intent classification and constraint extraction.
+    函数名是历史遗留，当前实现并不负责主要的“推荐”快速路由；
+    推荐、加购和查看购物车主要由 ``maybe_cart_intent`` 处理。
+    本函数只对短问候和能力询问做确定性判断，其余返回 None。
     """
     text = message.strip()
 
     lowered = text.lower()
+    # 只对短句生效，避免长购物需求中偶然出现“你好”时被误判为闲聊。
     if len(text) <= 5 and any(g in lowered for g in _SHORT_GREETING_PATTERNS):
         return IntentResult(intent="chitchat", confidence=1.0)
 
+    # “你能做什么”属于能力询问，不应触发商品检索。
     if any(m in text for m in _CAPABILITY_QUESTION_MARKERS):
         return IntentResult(intent="chitchat", confidence=1.0)
 
+    # 无法确定时不猜测，交给下一层。
     return None
 
 
@@ -498,47 +526,66 @@ _CONSTRAINT_AFTER_REMOVE = ("含", "超过", "低于", "所有", "全部", "的"
 
 
 def maybe_cart_intent(message: str) -> IntentResult | None:
-    """Deterministic cart / recommend intent pre-check.
+    """识别明确的购物车操作和短推荐请求。
 
-    Returns an IntentResult for unambiguous cart actions or recommendation
-    signals, or None to fall through to the LLM intent classifier.
+    返回值协议：
 
-    Priority: cart_remove > cart_add > cart_view > recommend_exclude > recommend
+    - 返回 ``IntentResult``：规则命中，通常可跳过一次 LLM 调用；
+    - 返回 ``None``：表达有歧义，继续走其他规则或 LLM。
+
+    顺序本身就是业务规则：删除 > 加购 > 查看购物车 > 排除式推荐 > 普通推荐。
+    类似 Java 责任链，但这里由一个函数中的有序分支实现。
     """
     text = message.strip()
+
     # P0: cart item removal (must precede exclusion detection — "不要了" ≠ "不要含")
     # P0a: unambiguous remove markers — always safe
     for kw in _CART_REMOVE_UNAMBIGUOUS:
         if kw in text:
+            # “不要了”明确表示删除购物车商品。
             return IntentResult(intent="remove_from_cart", confidence=1.0)
+
     # P0b: ambiguous remove markers — guard against "去掉含酒精的" (exclusion)
     for kw in _CART_REMOVE_AMBIGUOUS:
+        # find 返回关键词首次出现的位置；-1 表示未出现。
         idx = text.find(kw)
         if idx == -1:
             continue
+
         # Check if the keyword is followed by a constraint word
+        # 只观察关键词之后的内容，用于区分：
+        # “把这个去掉” → 删除商品；“去掉含酒精的” → 推荐约束。
         after = text[idx + len(kw):].strip()
         is_exclusion = any(after.startswith(c) for c in _CONSTRAINT_AFTER_REMOVE)
         if not is_exclusion:
             return IntentResult(intent="remove_from_cart", confidence=1.0)
+
     # P1: cart add
     for kw in _CART_ADD_MARKERS:
         if kw in text:
+            # 此处只确定“加购”动作，目标商品可能需要 Pipeline 继续解析。
             return IntentResult(intent="add_to_cart", confidence=1.0)
+
     # P2: cart view
     for kw in _CART_VIEW_MARKERS:
         if kw in text:
             return IntentResult(intent="view_cart", confidence=1.0)
+
     # P3: recommendation with explicit exclusion constraint
     for kw in _RECOMMEND_EXCLUDE_MARKERS:
         if kw in text:
+            # “不要含酒精”不是删购物车，而是带排除条件重新推荐。
             return IntentResult(intent="recommend", confidence=1.0)
+
     # P4: generic recommendation — only for short messages (≤30 chars)
     #     to avoid misclassifying complex messages that mention "推荐" in passing.
     if len(text) <= 30:
         for kw in _RECOMMEND_FAST_MARKERS:
             if kw in text:
+                # 短且明确的“推荐/帮我找”可直接分类；完整约束由 Criteria 阶段生成。
                 return IntentResult(intent="recommend", confidence=1.0)
+
+    # 长句或语义复杂时宁可交给 LLM，也不做高风险猜测。
     return None
 
 
@@ -765,28 +812,35 @@ _CN_ORDINAL_PATTERN = re.compile(r"第([一二三四五])")
 
 
 def is_compare_phrase(message: str) -> bool:
-    """Deterministic check: does this message look like a compare request?"""
+    """判断文本是否表达了商品对比意图。
+
+    第一部分覆盖固定关键词，第二部分用正则覆盖“第一款和第三款比一下”
+    等组合表达。这里只判断“是否想对比”，不负责解析具体商品 ID。
+    """
     text = message.strip().lower()
     return any(marker.lower() in text for marker in _COMPARE_MARKERS) or _COMPARE_VERB_PATTERN.search(text) is not None
 
 
 def resolve_compare_targets(message: str, previous_product_ids: list[str]) -> list[str]:
-    """Resolve ordinal references in a compare message to actual product IDs.
+    """把自然语言序数映射为上一轮推荐中的真实商品 ID。
 
-    Handles patterns like:
-    - "第一个和第二个" -> [ids[0], ids[1]]
-    - "前三款" -> ids[:3]
-    - "对比1和3" -> [ids[0], ids[2]]
+    例如 ``previous_product_ids=[A,B,C]``：
 
-    Returns the resolved product IDs, or empty list if resolution fails.
+    - “第一个和第二个” → ``[A, B]``；
+    - “前三款” → ``[A, B, C]``。
+
+    解析失败返回空列表，调用方会选择降级或重新推荐，绝不凭空构造 ID。
     """
     if not previous_product_ids:
+        # 没有上一轮候选，“第一个”没有参照物。
         return []
 
+    # indices 保存零基下标，并在解析时去重。
     indices: list[int] = []
 
     # Arabic numerals: "第1个和第3个" or "1和3"
     for match in _ORDINAL_PATTERN.finditer(message):
+        # 用户序数从 1 开始，Python 列表从 0 开始，因此减 1。
         idx = max(0, int(match.group(1)) - 1)
         if idx not in indices:
             indices.append(idx)
@@ -801,12 +855,15 @@ def resolve_compare_targets(message: str, previous_product_ids: list[str]) -> li
     top_n_match = re.search(r"前\s*(\d+|[一二三四五])\s*(?:个|款|件)", message)
     if top_n_match and not indices:
         raw = top_n_match.group(1)
+        # 中文数字从映射表取零基下标后 +1；阿拉伯数字直接转 int。
         n = _CN_ORDINAL_MAP.get(raw, 0) + 1 if not raw.isdigit() else int(raw)
+        # min 防止用户说“前五个”但上一轮只有三个商品时越界。
         indices = list(range(min(n, len(previous_product_ids))))
 
     if not indices:
         return []
 
+    # 最后一道边界检查：只返回确实存在于上一轮列表中的商品。
     resolved = []
     for idx in indices:
         if 0 <= idx < len(previous_product_ids):

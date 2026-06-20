@@ -440,27 +440,22 @@ async def _run_chat_turn(ctx: StreamContext, body: ChatStreamRequest) -> AsyncGe
     # 打印日志：session_id / turn_id / 消息前 50 个字符
     logger.info("[timing] session=%s turn=%s msg=%s...", ctx.session_id, ctx.turn_id, body.message[:50])
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # 阶段 1：图片预分析
-    # ═══════════════════════════════════════════════════════════════════════════
-    pipeline_body = None  # pipeline_body 将持有可能被修改过的请求体
+    # 阶段 1：图片预分析。没有图片时原样返回 body；有图片时会把识别结果补进 message。
+    pipeline_body = None
     t_prep_start = time.perf_counter()
 
-    # async for 迭代 _prepare_pipeline_body 产出的每个 item
-    # 这个 stage 可能产出两种东西：
-    #   - StageResult(ChatStreamRequest) → 阶段完成了，Item.value 包含（可能已修改的）body
-    #   - ThinkingEvent → 心跳事件，发给前端显示"正在分析图片"
+    # 预处理阶段会交替产出：
+    #   1. ThinkingEvent：图片分析期间的进度事件，需要继续发给客户端；
+    #   2. StageResult：阶段完成，value 中是后续 Pipeline 要使用的请求体。
     async for item in _prepare_pipeline_body(ctx, body):
         if isinstance(item, StageResult):
-            # isinstance 检查 item 是否是 StageResult 类型（类似 Java 的 instanceof）
-            pipeline_body = item.value  # StageResult 的 value 字段携带 ChatStreamRequest
+            pipeline_body = item.value
         else:
-            yield item  # 不是 StageResult 就是 ThinkingEvent，直接发给客户端
+            yield item
 
-    # 防御性检查：_prepare_pipeline_body 必须产出 StageResult
+    # 按函数契约必须得到 StageResult；缺失说明预处理流程实现有误。
     if pipeline_body is None:
         raise RuntimeError("pipeline body stage completed without a result.")
-    # 记录图片分析耗时
     logger.info("[timing] image_analysis=%.3fs", time.perf_counter() - t_prep_start)
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -588,67 +583,47 @@ async def _run_chat_turn(ctx: StreamContext, body: ChatStreamRequest) -> AsyncGe
 async def _prepare_pipeline_body(
     ctx: StreamContext, body: ChatStreamRequest
 ) -> AsyncGenerator[SSEEventBase | StageResult[ChatStreamRequest], None]:
-    # ↑ 返回类型：AsyncGenerator 的产出类型是 SSEEventBase | StageResult[ChatStreamRequest]
-    #   用 | 表示"或"（Union 类型的新写法，Python 3.10+ 支持）
-    #   这意味着这个 generator 产出的 item 要么是 SSE 事件，要么是 StageResult 包裹的 body
     """
-    有图片时调 Qwen-VL-Plus 分析 → 把分析结果拼接到用户消息文本末尾。
-    没有图片时什么都不做，直接透传 body。
+    为后续 Pipeline 准备请求体。
 
-    为什么图片分析要放在最前面（在意图识别之前）？
-    图片分析结果中包含品类/品牌/肤质/成分等信息。
-    先分析再识别，LLM 看到了图片上下文，意图识别的准确度会显著提升。
+    - 无图片：直接产出原请求体。
+    - 有图片：先发送分析状态，再调用视觉模型，并将识别出的品类、描述和
+      可见特征追加到 message，使后续意图识别和标准生成同时理解文字与图片。
 
-    例：
-      用户上传护肤品照片 + 文字"这个适合敏感肌吗？"
-      → Qwen-VL 返回: "这是XX品牌的控油洗面奶，适合油性肤质，含水杨酸"
-      → message_with_image_context 拼接后:
-        "这个适合敏感肌吗？[图片分析: XX品牌控油洗面奶，适合油性肤质，含水杨酸]"
-      → 后续意图识别时，LLM 看到完整的上下文，能正确判断：
-        category=美妆护肤, product_type=洗面奶, skin_type=油性, ingredient=水杨酸
+    该异步生成器会产出两类值：
+    - SSEEventBase：图片分析期间的 thinking 事件，交给客户端显示；
+    - StageResult[ChatStreamRequest]：最终请求体，仅供 Pipeline 内部使用。
     """
-    if body.image_url:  # 只有带图片的请求才需要分析
-        # ctx.thinking() 创建一个 ThinkingEvent
-        #   参数："analyzing_image"=阶段标识(前端用来显示不同文案)
-        #         msg.THINKING_ANALYZING_IMAGE=展示给用户的文字(如"正在分析图片...")
+    if body.image_url:
+        # 先立即反馈状态，避免用户在首次模型调用期间看到空白等待。
         yield ctx.thinking("analyzing_image", msg.THINKING_ANALYZING_IMAGE)
 
-        image_analysis: dict[str, Any] | None = None  # 将持有 VL 模型返回的分析结果
+        image_analysis: dict[str, Any] | None = None
 
-        # ctx.ensure_active() 检查当前 turn 是否已被用户取消
-        #   如果 cancel_token 已被 set → 抛出 StreamCancelled 异常 → 被 chat_stream 的 except 捕获
+        # 在启动外部模型调用前先响应用户取消。
         ctx.ensure_active()
 
-        # ★ run_with_heartbeat 是一个包装函数，它做三件事：
-        #   1. 启动被包装的协程（ctx.stages.run_multimodal(body.image_url)）
-        #   2. 在等待期间每 0.8 秒自动 yield 一个 thinking 心跳事件（前端不卡死）
-        #   3. 监听 cancel_token，用户取消时立即中断
-        #
-        # ctx.stages.run_multimodal(body.image_url) 最终调用：
-        #   stages/multimodal.py 的 run_multimodal() → llm_client.analyze_image()
+        # run_with_heartbeat 在等待视觉模型时定期产出 thinking，并检查取消状态；
+        # 模型完成后则产出 StageResult，其中 value 是图片分析结果。
         async for image_item in run_with_heartbeat(
             ctx,
-            ctx.stages.run_multimodal(body.image_url),  # 要执行的协程
-            "analyzing_image",                            # 阶段标识
-            msg.THINKING_ANALYZING_IMAGE,                 # 心跳文案
-            timing_key="image_analysis",                  # 计时键（用于 stage_timings_ms）
+            ctx.stages.run_multimodal(body.image_url),
+            "analyzing_image",
+            msg.THINKING_ANALYZING_IMAGE,
+            timing_key="image_analysis",
         ):
             if isinstance(image_item, StageResult):
-                # StageResult 表示阶段完成了，value 携带结果
-                image_analysis = image_item.value  # VL 返回的 dict，包含类别/品牌/肤质等分析
+                image_analysis = image_item.value
             else:
-                # 不是 StageResult 就是 ThinkingEvent（心跳事件）
-                yield image_item  # 直接发给客户端
+                yield image_item
 
-        # 把 VL 分析结果注入到消息体中
-        # Pydantic 的 model_copy(update={...}) 方法：
-        #   创建原对象的一个新副本，同时更新指定字段。原对象不被修改。
-        # message_with_image_context 函数把原始消息和图片分析结果拼接成新的消息文本
+        # 复制 Pydantic 请求对象，仅替换 message，不修改 API 层传入的原始 body。
+        # 图片分析失败时 image_analysis 为 None，辅助函数会保留原消息。
         body = body.model_copy(update={
             "message": message_with_image_context(body.message, image_analysis)
         })
 
-    # StageResult(body) 包装阶段结果 —— 告诉调用方"这个阶段完成了，这是产出"
+    # 无论是否有图片，都以统一的 StageResult 结束该阶段。
     yield StageResult(body)
 
 
@@ -699,7 +674,7 @@ async def _resolve_intent(
     #   1. 检测用户消息是否包含预算修改意图
     #   2. 提取数字（"200"→200, "以内"→budget_max）
     #   3. 检查上一轮是否有购买标准可以修改
-    #   4. 返回 (修改后的 body, continue 意图的 IntentResult) 或 (原 body, None)
+    #   4. 返回 (修改后的 body, recommend 意图的 IntentResult) 或 (原 body, None)
     # 这个函数可能同时返回两个值（元组解包），synthetic_intent 非 None 表示规则命中
     pipeline_body, synthetic_intent = await maybe_intercept_budget_patch(ctx.session_id, pipeline_body)
 
@@ -716,9 +691,10 @@ async def _resolve_intent(
             category=prev.category or None if prev else None,  # 继承上一轮的品类
         )
 
-    # ── 规则 3/4/5：购物意图确定性检测 ───────────────────────────────────────────
-    # 三个检测函数内部各自维护了中文购物相关的关键词/短语列表，
-    # 通过正则和字典匹配。匹配成功返回 IntentResult，失败返回 None。
+    # ── 规则 3/4/5：结算、购物车与闲聊的确定性检测 ────────────────────────────────
+    # 前两个函数处理结算/购物车/短推荐语句；maybe_shopping_intent 是历史命名，
+    # 当前主要识别短问候和能力询问，并快速路由到 chitchat。
+    # 匹配成功返回 IntentResult，失败返回 None。
     #
     # 跳过条件（不进规则，交给 LLM）：
     #   - 有 image_url：图片场景比较复杂，LLM 更擅长
@@ -728,7 +704,7 @@ async def _resolve_intent(
         determined = (
             maybe_checkout_intent(pipeline_body.message)     # "结算/买单/去付款" → checkout_confirm
             or maybe_cart_intent(pipeline_body.message)      # "加入购物车/放进去" → add_to_cart
-            or maybe_shopping_intent(pipeline_body.message)  # "推荐/有什么好的" → recommend
+            or maybe_shopping_intent(pipeline_body.message)  # "你好/你能做什么" → chitchat
         )
         # 防御性检查：如果三个规则中某个命中了 checkout_confirm，
         # 但购物车实际是空的 → 用户可能在说"结算"但从未加购过 → 退回 shopping 意图
@@ -831,7 +807,7 @@ async def _resolve_intent(
         # 7 条规则全没命中 → LLM 上场
         # ctx.stages.run_intent 最终调用 stages/intent.py → llm_client.analyze_intent()
         # 这个 LLM 调用会：
-        #   1. 加载 backend/prompts/intent.md 作为 system prompt
+        #   1. 加载 backend/prompts/intent_analysis.md 作为 system prompt
         #   2. 把用户消息 + 对话历史拼成 messages
         #   3. POST 到百炼/Doubao API
         #   4. 解析返回的 JSON，构造 IntentResult
